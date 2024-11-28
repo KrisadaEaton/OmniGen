@@ -1,5 +1,6 @@
 # The code is revised from DiT
 import os
+import gc
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,9 +11,11 @@ from diffusers.loaders import PeftAdapterMixin
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
+from accelerate import init_empty_weights
+from transformers import BitsAndBytesConfig
 
 from OmniGen.transformer import Phi3Config, Phi3Transformer
-
+from OmniGen.utils import quantize_bnb
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -185,22 +188,51 @@ class OmniGen(nn.Module, PeftAdapterMixin):
 
         self.llm = Phi3Transformer(config=transformer_config)
         self.llm.config.use_cache = False
+
+        # bnb 4bit quantized models cannot be offloaded
+        self.offloadable = True
+        self.quantization_config = None
     
     @classmethod
-    def from_pretrained(cls, model_name):
+    def from_pretrained(cls, model_name: str|os.PathLike, dtype: torch.dtype = torch.bfloat16, quantization_config: BitsAndBytesConfig = None, low_cpu_mem_usage: bool = True,):
         if not os.path.exists(model_name):
             cache_folder = os.getenv('HF_HUB_CACHE')
             model_name = snapshot_download(repo_id=model_name,
                                            cache_dir=cache_folder,
                                            ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5'])
-        config = Phi3Config.from_pretrained(model_name)
-        model = cls(config)
-        if os.path.exists(os.path.join(model_name, 'model.safetensors')):
-            print("Loading safetensors")
-            ckpt = load_file(os.path.join(model_name, 'model.safetensors'))
+        
+        model_path = os.path.join(model_name, 'model.safetensors')
+        if not os.path.exists(model_path):
+            model_path = os.path.join(model_name, 'model.pt')
+            ckpt = torch.load(model_path, map_location='cpu')
         else:
-            ckpt = torch.load(os.path.join(model_name, 'model.pt'), map_location='cpu')
-        model.load_state_dict(ckpt)
+            #print("Loading safetensors")
+            ckpt = load_file(model_path, 'cpu')
+
+        if low_cpu_mem_usage:
+            with init_empty_weights():
+                config = Phi3Config.from_pretrained(model_name)
+                model = cls(config)
+            
+            if quantization_config:
+                model = quantize_bnb(model, ckpt, quantization_config=quantization_config, pre_quantized=False)
+                if getattr(quantization_config, 'load_in_4bit', None):
+                    model.offloadable = False
+                model.quantization_config = quantization_config
+            else:
+                model.load_state_dict(ckpt, assign=True)
+        else:
+            if quantization_config:
+                raise ValueError('Quantization not supported for `low_cpu_mem_usage=False`.')
+            
+            config = Phi3Config.from_pretrained(model_name)
+            model = cls(config)
+            model.load_state_dict(ckpt)
+        
+        model = model.to(dtype)
+        del ckpt
+        torch.cuda.empty_cache()
+        gc.collect()
         return model
 
     def initialize_weights(self):
